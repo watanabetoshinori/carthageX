@@ -1,0 +1,385 @@
+#!/bin/sh
+exec ruby -S -x $0 "$@"
+#! ruby
+
+#
+#                _   _                     __  __
+#  ___ __ _ _ __| |_| |__   __ _  __ _  ___\ \/ /
+# / __/ _` | '__| __| '_ \ / _` |/ _` |/ _ \\  / 
+#| (_| (_| | |  | |_| | | | (_| | (_| |  __//  \ 
+# \___\__,_|_|   \__|_| |_|\__,_|\__, |\___/_/\_\
+#                                |___/       
+#
+
+$usage = <<EOS
+carthageX
+
+The extension script for `carthage`.
+
+Run using `carthageX [command]`
+
+Commands:
+  init      Generate Cartfile
+  update    Build packages and set up Xcode configuration
+  remove    Remove carthage file and confirutaion from Project
+  version   Show version number
+EOS
+
+$version = "0.0.1"
+
+class UI
+
+  def self.header(message)
+    puts "\e[32m"
+    message.each_line {|line|
+      puts line
+    }
+    puts "\e[0m"
+  end
+
+  def self.guide(message)
+    message.each_line {|line|
+      puts line
+    }
+  end
+
+  def self.message(message)
+    puts formatter(message)
+  end
+
+  def self.success(message)
+    formatted_message = formatter(message)
+    puts "\e[32m#{formatted_message}\e[0m"
+  end
+
+  def self.error(message)
+    formatted_message = formatter(message)
+    puts "\e[31m#{formatted_message}\e[0m"
+  end
+
+  def self.formatter(message)
+    "[#{Time.now.strftime('%H:%M:%S')}]: #{message}"
+  end
+
+  def self.loading 
+    chars = %w[| / - \\]
+    delay = 0.1
+    iter = 0
+    spinner = Thread.new do
+      while iter do
+        print chars[(iter+=1) % chars.length]
+        sleep delay
+        print "\b"
+      end
+    end
+    yield.tap {
+      iter = false
+      spinner.join
+    }
+  end
+
+end
+
+
+class Command
+
+  def self.version
+    UI.guide $version
+    exit 0
+  end
+
+  def self.init
+    UI.header <<~EOS
+    ##########
+    # Init
+    ##########
+    EOS
+
+    require 'fileutils'
+
+    files = Dir.glob("*.xcodeproj")
+
+    if files.count == 0 then
+      UI.error "Could not find iOS project in current directory"
+      exit 1
+    end
+
+    cart_file = Dir.glob("Cartfile")
+
+    if cart_file.count == 0 then
+      FileUtils.touch("Cartfile")
+      UI.success "Cartfile created"
+    else
+      UI.message "Cartfile is already exist"
+    end
+
+    exit 0
+  end
+
+  def self.update
+    UI.header <<~EOS
+    ##########
+    # Update
+    ##########
+    EOS
+
+    begin
+      require 'xcodeproj'
+    rescue LoadError
+      UI.error "Could not find xcodeproj gem"
+      UI.message "Please install using `gem install xcodeproj`"
+      exit 1
+    end
+
+    files = Dir.glob("*.xcodeproj")
+
+    if files.count == 0 then
+      UI.error "Could not find iOS project in current directory"
+      exit 1
+    end
+
+    project_path = files[0]
+
+    UI.message "Found the iOS project file: " + project_path
+
+    support_watchOS = `cat #{project_path}/project.pbxproj | grep com.apple.product-type.application.watchapp`.include? "om.apple.product-type.application.watchapp"
+
+    cart_file = Dir.glob("Cartfile")
+
+    if cart_file.count == 0 then
+      UI.error "Could not find Cartfile in current directory"
+      UI.message "Please create using `carthageX init`"
+      exit 1
+    end
+
+    unless `which carthage`.include? "carthage"
+      UI.error 'Carthage not installed'
+      UI.message "Please install using `brew install carthage`"
+    end
+
+    #
+    # Build frameworks
+    #
+
+    UI.message "Build carthage frameworks..."
+
+    UI.loading {
+      target = support_watchOS ? "iOS,watchOS" : "iOS"
+
+      build = `carthage update --platform #{target}`
+
+      UI.message(build)
+    }
+
+    frameworks = Dir.glob("Carthage/build/iOS/*.framework")
+
+    if frameworks.count == 0 then
+      UI.error "Could not find Carthage frameworks"
+      exit 1
+    end
+
+    UI.message "Configure Xcode project..."
+
+    project = Xcodeproj::Project.open(project_path)
+
+    #
+    # Add framework references
+    #
+
+    framework_buildphase = project.objects.select{|x| x.class == Xcodeproj::Project::Object::PBXFrameworksBuildPhase}[0]
+
+    unless framework_buildphase
+      framework_buildphase = project.new(Xcodeproj::Project::Object::PBXFrameworksBuildPhase)
+      project.objects << framework_buildphase
+    else
+      # remove old build frameworks
+      current_frameworks = project.frameworks_group.files.select {|framework| framework.path.start_with? "Carthage/Build/" }
+      current_frameworks.each do |framework| 
+        framework_buildphase.remove_file_reference(framework)
+        framework.remove_from_project
+      end
+    end
+
+    # add build frameworks
+    frameworks.each do |framework|
+      lib_ref = project.frameworks_group.new_file(framework)
+      framework_buildphase.add_file_reference(lib_ref)
+    end
+
+    # add serch path
+    project.targets.each do |target|
+      target.build_configuration_list.build_configurations.each do |configuration|
+          search_path = configuration.build_settings["FRAMEWORK_SEARCH_PATHS"]
+          unless search_path
+            configuration.build_settings["FRAMEWORK_SEARCH_PATHS"] = ["$(inherited)", "$(PROJECT_DIR)/Carthage/Build/iOS"]
+          else
+            unless search_path.include? "$(PROJECT_DIR)/Carthage/Build/iOS"
+              search_path << "$(PROJECT_DIR)/Carthage/Build/iOS"
+            end
+          end
+      end
+    end
+
+    #
+    # Add Run Script phase
+    #
+
+    project.targets.each do |target|
+      run_script_phase = target.build_phases.select{|x| x.class == Xcodeproj::Project::Object::PBXShellScriptBuildPhase && x.shell_script == "/usr/local/bin/carthage copy-frameworks" }[0]
+
+      unless run_script_phase
+        run_script_phase = project.new(Xcodeproj::Project::Object::PBXShellScriptBuildPhase)
+        run_script_phase.shell_script = "/usr/local/bin/carthage copy-frameworks"
+      end
+
+      run_script_phase.input_paths = frameworks.map {|framework| "$(SRCROOT)/" + framework }
+
+      run_script_phase.output_paths = frameworks.map {|framework| "$(BUILT_PRODUCTS_DIR)/$(FRAMEWORKS_FOLDER_PATH)/" + File.basename(framework) }
+
+      target.build_phases << run_script_phase
+    end
+
+    # save project
+    project.save()
+
+    UI.success "Build succeeded!"
+
+    exit 0
+
+  end
+
+  def self.remove
+    UI.header <<~EOS
+    ##########
+    # Remove
+    ##########
+    EOS
+
+    begin
+      require 'xcodeproj'
+    rescue LoadError
+      UI.error "Could not find xcodeproj gem"
+      UI.message "Please install using `gem install xcodeproj`"
+      exit 1
+    end
+
+    files = Dir.glob("*.xcodeproj")
+
+    if files.count == 0 then
+      UI.error "Could not find iOS project in current directory"
+      exit 1
+    end
+
+    project_path = files[0]
+
+    UI.message "Found the iOS project file: " + project_path
+
+    UI.message "Remove Xcode configurations..."
+
+    project = Xcodeproj::Project.open(project_path)
+
+    #
+    # Remove framework references
+    #
+
+    framework_buildphase = project.objects.select{|x| x.class == Xcodeproj::Project::Object::PBXFrameworksBuildPhase}[0]
+
+    if framework_buildphase
+      current_frameworks = project.frameworks_group.files.select {|framework| framework.path.start_with? "Carthage/Build/" }
+      current_frameworks.each do |framework| 
+        framework_buildphase.remove_file_reference(framework)
+        framework.remove_from_project
+      end
+    end
+
+    #
+    # Remove Run Script phase
+    #
+
+    project.targets.each do |target|
+      run_script_phase = target.build_phases.select{|x| x.class == Xcodeproj::Project::Object::PBXShellScriptBuildPhase && x.shell_script == "/usr/local/bin/carthage copy-frameworks" }[0]
+      if run_script_phase then
+        run_script_phase.remove_from_project
+      end
+    end
+
+    # remove search path
+    project.targets.each do |target|
+      target.build_configuration_list.build_configurations.each do |configuration|
+          search_path = configuration.build_settings["FRAMEWORK_SEARCH_PATHS"]
+          if search_path != nil
+            if search_path.include? "$(PROJECT_DIR)/Carthage/Build/iOS"
+              search_path.delete "$(PROJECT_DIR)/Carthage/Build/iOS"
+            end
+          end
+      end
+    end
+
+
+    # save project
+    project.save()
+
+    #
+    # Remove Carthage files
+    #
+
+    UI.message "Remove carthage build frameworks..."
+
+    require 'fileutils'
+
+    if Dir.exist?("Carthage") then
+      FileUtils.rm_rf("Carthage")
+    end
+
+    if File.exist?("Cartfile.resolved") then
+      FileUtils.rm("Cartfile.resolved")
+    end
+
+    if File.exist?("Cartfile") then
+      FileUtils.rm("Cartfile")
+    end
+
+    UI.success "Remove succeeded!"
+
+    exit 0
+  end
+
+  def self.usage
+    UI.message $usage
+    exit 0
+  end
+
+  def self.module_exists?(name, base = self.class)
+    base.const_defined?(name) &&
+    base.const_get(name).instance_of?(::Module)
+  end
+
+end
+
+
+# Main
+
+if __FILE__ == $0
+  require 'optparse'
+  command = ARGV[0]
+
+  if command == nil then
+    Command.usage()
+  end
+
+  case command
+  when "init" then
+    Command.init()
+  when "update" then
+    Command.update()
+  when "remove" then
+    Command.remove()
+  when "help" then
+    Command.usage()
+  when "version" then
+    Command.version()
+  end
+
+  UI.error "Unrecognized command: '#{command}'. See `carthagex help`."
+  exit 1
+end
